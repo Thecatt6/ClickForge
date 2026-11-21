@@ -1,0 +1,28 @@
+schema_version = 1
+device = "auto"
+double_toggle_button = "back"
+triple_toggle_button = "forward"
+double_enabled = true
+triple_enabled = false
+osd = "overlay"
+gap_ms = 45
+press_ms = 12
+max_hold_ms = 250
+
+# Il sinistro produce 2 click e il destro 4 quando il profilo 2x è attivo.
+[[double_rules]]
+button = "left"
+clicks = 2
+
+[[double_rules]]
+button = "right"
+clicks = 4
+
+# Il sinistro produce 3 click e il destro 5 quando il profilo 3x è attivo.
+[[triple_rules]]
+button = "left"
+clicks = 3
+
+[[triple_rules]]
+button = "right"
+clicks = 5
