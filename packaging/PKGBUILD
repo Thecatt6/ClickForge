@@ -1,0 +1,37 @@
+# Maintainer: Thecatt6
+# PKGBUILD di esempio per ClickForge su Arch Linux / CachyOS.
+# Crea prima il tag di rilascio (es. v0.7.0), poi:
+#   updpkgsums            # oppure sha256sums=('SKIP')
+#   makepkg -si
+pkgname=clickforge
+pkgver=0.7.0
+pkgrel=1
+pkgdesc="Mouse click multiplier per Linux: regole per pulsante e per profilo, GUI GTK4, overlay Wayland"
+arch=('x86_64')
+url="https://github.com/Thecatt6/ClickForge"
+license=('MIT')
+depends=('gtk4' 'gtk4-layer-shell' 'polkit' 'libnotify')
+makedepends=('rust' 'base-devel')
+source=("git+${url}.git#tag=v${pkgver}")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$srcdir/$pkgname"
+  # Assicura le versioni esatte delle dipendenze dichiarate dal progetto.
+  cargo fetch --locked || cargo fetch
+}
+
+build() {
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo build --frozen --release || cargo build --release
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+  install -Dm755 "target/release/clickforge" "$pkgdir/usr/bin/clickforge"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+  install -Dm644 config.example.toml "$pkgdir/usr/share/doc/$pkgname/config.example.toml"
+}

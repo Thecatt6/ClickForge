@@ -1,6 +1,16 @@
-# ClickForge 0.6.0
+# ClickForge 0.7.0
 
 ClickForge è un moltiplicatore di click per Linux scritto in Rust. Legge gli eventi del mouse fisico tramite `evdev`, acquisisce il dispositivo in esclusiva e inoltra gli eventi tramite un mouse virtuale `uinput`. È pensato per funzionare sia con Wayland sia con X11, indipendentemente dall'ambiente desktop.
+
+## Novità della 0.7.0
+
+- **Puntatore fluido anche durante i click moltiplicati:** i click aggiuntivi vengono generati da un thread dedicato, senza bloccare il loop di lettura del mouse fisico. Prima, ogni click moltiplicato "congelava" il puntatore per `gap × click` millisecondi (il salto percepito come movimento a scatti).
+- **Ciclo di attesa basato su `poll()`:** gli eventi vengono letti appena arrivano (max 2 ms di latenza) invece che con sleep a vuoto da 3 ms.
+- **Il pulsante "Ferma" della GUI ferma davvero il motore:** il motore rilascia i privilegi di root subito dopo aver aperto i dispositivi (torna all'utente di `pkexec`/`sudo`), scrive un pid file (`~/.config/clickforge/clickforge.pid`) e la GUI invia `SIGTERM`. Il motore gestisce `SIGTERM`/`SIGHUP` oltre a `Ctrl+C` e rilascia il mouse fisico in modo pulito.
+- **Privilegio minimo:** il ciclo di elaborazione non gira più come root; solo l'apertura di `/dev/input` e `/dev/uinput` resta privilegiata. Wayland/D-Bus/HOME vengono riallineati alla sessione grafica dell'utente.
+- **Rilevamento scollegamento del mouse:** messaggio chiaro se il dispositivo di input sparisce (POLLERR/POLLHUP).
+- **CI su GitHub Actions** (build, test, release build su Arch Linux) e packaging di esempio (`packaging/PKGBUILD`).
+- **`Cargo.lock` non più ignorato:** i binari dovrebbero sempre committare il lockfile (vedi sotto).
 
 ## Novità della 0.6.0
 
@@ -40,6 +50,8 @@ cargo build --release
 
 Cargo scarica automaticamente le crate Rust necessarie. L'eseguibile sarà `target/release/clickforge`.
 
+> **`Cargo.lock`:** da questa versione il lockfile non è più ignorato da git. Prima di committare, genera il lockfile in un ambiente con accesso a crates.io (`cargo generate-lockfile`) e aggiungilo al repository: serve per build riproducibili e per la CI/packaging. Finché non è committato, `cargo build --locked` fallirà.
+
 ## Avvio rapido da terminale
 
 ```bash
@@ -75,6 +87,10 @@ La GUI permette di:
 - salvare la configurazione, avviare/fermare il motore e aprire il log.
 
 La GUI non viene eseguita come root. Quando premi **Avvia ClickForge**, `pkexec` richiede l'autorizzazione per il solo motore che deve accedere a `/dev/input` e `/dev/uinput`.
+
+Il motore, subito dopo aver aperto i dispositivi, **rilascia i privilegi di root** e continua come il tuo utente: il ciclo di elaborazione degli eventi non gira come root. Il rilascio scatta solo quando l'utente invocatore è individuabile tramite `PKEXEC_UID` (pkexec) o `SUDO_UID` (sudo); in caso contrario il motore continua come root, come nella 0.6.0.
+
+Il pulsante **Ferma** invia `SIGTERM` al motore tramite il pid file `~/.config/clickforge/clickforge.pid`: il motore esce dal loop, rilascia il mouse fisico e rimuove il pid file. Se il pid file manca o il motore non risponde entro ~2 secondi, la GUI ripiega sull'uccisione del processo `pkexec` (comportamento della 0.6.0).
 
 La configurazione è salvata in:
 
@@ -196,6 +212,7 @@ sudo target/release/clickforge --gap-ms 55 --press-ms 15 --max-hold-ms 250
 --gap-ms <MS>                   Intervallo tra click aggiuntivi (default: 45)
 --press-ms <MS>                 Durata click virtuale (default: 12)
 --max-hold-ms <MS>              Soglia pressione lunga (default: 250)
+--pidfile <PATH>                Scrive il PID del motore in PATH (usato dalla GUI per Ferma)
 -h, --help                      Mostra l'aiuto
 -V, --version                   Mostra la versione
 ```
@@ -204,24 +221,36 @@ Il vecchio argomento `--click-button` e i relativi conteggi `--double-clicks` / 
 
 ## Note di funzionamento e sicurezza
 
-- Avviare il motore richiede accesso a `/dev/input` e `/dev/uinput`; da terminale si usa `sudo`, dalla GUI viene richiesto `pkexec`.
+- Avviare il motore richiede accesso a `/dev/input` e `/dev/uinput`; da terminale si usa `sudo`, dalla GUI viene richiesto `pkexec`. Solo l'apertura e la presa esclusiva dei dispositivi sono privilegiate: dopo il `grab()`, il motore rilascia i privilegi di root e continua come l'utente che lo ha invocato (se individuabile).
 - Il mouse fisico viene acquisito in esclusiva; gli eventi passano attraverso il mouse virtuale ClickForge. Se il programma termina inaspettatamente, il kernel rilascia il dispositivo quando il processo chiude il file descriptor.
 - I pulsanti configurati come interruttori vengono intercettati e non inoltrati alle applicazioni.
 - Le pressioni lunghe oltre `max-hold-ms` non generano click aggiuntivi, così da non moltiplicare i trascinamenti.
 - Il profilo selezionato viene fotografato alla pressione del pulsante: cambiare profilo mentre un pulsante è già premuto non cambia il conteggio di quel singolo click.
 - Se il mouse espone interfacce evdev separate, può essere necessario specificare manualmente il dispositivo che contiene tutti i pulsanti usati.
-- Per uscire dalla modalità terminale, premi `Ctrl+C`.
+- Per uscire dalla modalità terminale, premi `Ctrl+C`. Il motore accetta anche `SIGTERM` e `SIGHUP` (con uscita pulita), che è il meccanismo usato dal pulsante **Ferma** della GUI.
+- `--pidfile <PATH>`: il motore scrive il proprio PID nel file indicato; il file viene rimosso all'uscita. È un'opzione pensata per launcher/GUI; l'uso da terminale non ne ha bisogno.
 
 ## Dipendenze Rust
 
 - `evdev`
 - `clap`
-- `ctrlc`
+- `ctrlc` (con la feature `termination`, per SIGTERM/SIGHUP oltre a Ctrl+C)
 - `anyhow`
 - `libc`
 - `serde`
 - `toml`
 - `gtk4`
 - `gtk4-layer-shell`
+
+## CI e packaging
+
+- `packaging/ci.yml`: workflow GitHub Actions di riferimento (check, test, clippy, build di rilascio su Arch Linux). Il workflow non è stato attivato automaticamente perché l'automazione di questa sessione non ha il permesso `workflows` per scrivere in `.github/workflows/`. Per attivarlo sul repository:
+
+  ```bash
+  mkdir -p .github/workflows
+  cp packaging/ci.yml .github/workflows/ci.yml
+  git add .github/workflows/ci.yml && git commit -m "CI: attiva workflow GitHub Actions" && git push
+  ```
+- `packaging/PKGBUILD`: esempio di pacchetto Arch Linux (dipendenze, installazione, licenza e doc). Aggiornare il tag `v0.7.0` e i checksum alla creazione del rilascio.
 
 Licenza: MIT.

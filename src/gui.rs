@@ -135,6 +135,22 @@ fn log_path(config: &Path) -> PathBuf {
     config.parent().unwrap_or_else(|| Path::new(".")).join("clickforge.log")
 }
 
+fn pidfile_path(config: &Path) -> PathBuf {
+    config.parent().unwrap_or_else(|| Path::new(".")).join("clickforge.pid")
+}
+
+/// Verifica che `pid` sia davvero un processo ClickForge (evita di segnalare un PID
+/// riusato da un altro processo): legge /proc/<pid>/cmdline, disponibile su Linux.
+fn pid_belongs_to_clickforge(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    match fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(raw) => String::from_utf8_lossy(&raw).contains("clickforge"),
+        Err(_) => false,
+    }
+}
+
 fn load_config(path: &Path) -> (GuiConfig, Option<String>) {
     match fs::read_to_string(path) {
         Ok(contents) => match toml::from_str::<GuiConfig>(&contents) {
@@ -527,6 +543,7 @@ fn build_window(app: &gtk::Application) {
             let mut command = Command::new("pkexec");
             command
                 .arg(executable)
+                .arg("--pidfile").arg(pidfile_path(&settings_path))
                 .arg("--double-toggle-button").arg(&config.double_toggle_button)
                 .arg("--triple-toggle-button").arg(&config.triple_toggle_button)
                 .arg("--double-enabled").arg(config.double_enabled.to_string())
@@ -559,18 +576,71 @@ fn build_window(app: &gtk::Application) {
         });
     }
 
-    // Arresta il processo privilegiato avviato da pkexec.
+    // Arresta il motore: SIGTERM pulito tramite il pid file, poi (solo come
+    // ripiego) SIGKILL al processo pkexec. Il motore, dopo l'apertura dei dispositivi,
+    // rilascia i privilegi di root: l'utente può quindi inviargli SIGTERM direttamente.
     {
         let process = Rc::clone(&process);
         let status = status.clone();
+        let settings_path = settings_path.clone();
         stop_button.connect_clicked(move |_| {
-            if let Some(mut child) = process.borrow_mut().take() {
-                let _ = child.kill();
-                let _ = child.wait();
-                status.set_text("Richiesta di arresto inviata a ClickForge.");
-            } else {
+            let child_opt = process.borrow_mut().take();
+            let Some(mut child) = child_opt else {
                 status.set_text("ClickForge non risulta in esecuzione.");
+                return;
+            };
+            let pidfile = pidfile_path(&settings_path);
+            status.set_text("Arresto in corso…");
+
+            let mut engine_stopped = false;
+            let mut root_blocked_pid = None;
+            if let Ok(contents) = fs::read_to_string(&pidfile) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    if pid_belongs_to_clickforge(pid) {
+                        // SIGTERM: il gestore dei segnali del motore esce dal loop
+                        // e rilascia il mouse fisico.
+                        let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+                        if rc == 0 {
+                            // Attendi fino a ~2 s che il motore termini; non tenere
+                            // il borrow su `process` durante l'attesa.
+                            for _ in 0..40 {
+                                match child.try_wait() {
+                                    Ok(Some(_)) => { engine_stopped = true; break; }
+                                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                                    Err(_) => break,
+                                }
+                            }
+                        } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+                            // Il motore gira ancora come root (sessione non
+                            // individuabile): un utente non può segnalarlo.
+                            root_blocked_pid = Some(pid);
+                        }
+                    }
+                }
             }
+
+            if let Some(pid) = root_blocked_pid {
+                // Rimetti il processo sotto sorveglianza della GUI: l'utente potrà
+                // riprovare Ferma dopo aver terminato il motore manualmente.
+                *process.borrow_mut() = Some(child);
+                status.set_text(format!(
+                    "Il motore gira come root e non può essere fermato dalla GUI. Esegui: sudo kill -TERM {pid}"
+                ));
+                return;
+            }
+
+            if !engine_stopped {
+                // Ripiego: pid file mancante/non valido o motore che non risponde;
+                // uccidi il processo pkexec come nella versione 0.6.0.
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+            let _ = fs::remove_file(&pidfile);
+            status.set_text(if engine_stopped {
+                "ClickForge arrestato. Il mouse fisico è stato rilasciato.".to_string()
+            } else {
+                "Arresto forzato inviato. Se il mouse resta catturato, controlla clickforge.log.".to_string()
+            });
         });
     }
 
@@ -618,4 +688,48 @@ fn build_window(app: &gtk::Application) {
     }
 
     window.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gui_config_defaults_match_shipped_example() {
+        let config = GuiConfig::default();
+        assert_eq!(config.double_toggle_button, "back");
+        assert_eq!(config.triple_toggle_button, "forward");
+        assert!(config.double_enabled);
+        assert!(!config.triple_enabled);
+        assert_eq!(config.osd, "overlay");
+    }
+
+    #[test]
+    fn validate_config_rejects_identical_toggles() {
+        let config = GuiConfig {
+            double_toggle_button: "back".to_string(),
+            triple_toggle_button: "back".to_string(),
+            ..GuiConfig::default()
+        };
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_toggle_used_as_multiplier() {
+        let config = GuiConfig {
+            double_toggle_button: "back".to_string(),
+            double_rules: vec![ButtonRule { button: "back".to_string(), clicks: 2 }],
+            ..GuiConfig::default()
+        };
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn current_process_is_detected_as_clickforge() {
+        assert!(!pid_belongs_to_clickforge(-1));
+        if Path::new("/proc").exists() {
+            // Il binario di test contiene "clickforge" nel proprio nome.
+            assert!(pid_belongs_to_clickforge(std::process::id() as i32));
+        }
+    }
 }

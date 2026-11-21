@@ -7,11 +7,14 @@ use evdev::{
 };
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
+    mpsc,
     Arc,
+    Mutex,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -93,6 +96,11 @@ struct Args {
     /// Modalità interna usata dal processo OSD (non usare manualmente)
     #[arg(long, hide = true)]
     osd_server: bool,
+
+    /// File in cui scrivere il PID del motore (la GUI lo usa per inviare SIGTERM e fermarlo
+    /// in modo pulito invece di uccidere pkexec)
+    #[arg(long, value_name = "PATH")]
+    pidfile: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -277,7 +285,7 @@ fn run() -> Result<()> {
         .with_relative_axes(&relative_axes)?
         .with_msc(&misc_codes)?
         .with_properties(&properties)?;
-    let mut virtual_mouse = builder
+    let virtual_mouse = builder
         .build()
         .context("impossibile creare il mouse virtuale (controlla /dev/uinput)")?;
 
@@ -288,10 +296,30 @@ fn run() -> Result<()> {
         .grab()
         .context("impossibile acquisire il mouse in esclusiva")?;
 
+    // Rilascia i privilegi il prima possibile: i descrittori dei dispositivi restano
+    // validi e il ciclo di elaborazione successivo NON gira più come root. L'ambiente
+    // (Wayland, D-Bus, HOME) viene riallineato alla sessione grafica dell'utente reale,
+    // così overlay e notifiche continuano a funzionare senza runuser.
+    if drop_privileges_to_invoking_user() {
+        println!("Privilegi di root rilasciati: ClickForge continua come utente non privilegiato.");
+    }
+
     let running = Arc::new(AtomicBool::new(true));
     let signal_flag = Arc::clone(&running);
+    // Gestisce SIGINT (Ctrl+C), SIGTERM e SIGHUP: in tutti i casi il motore
+    // termina in modo pulito e rilascia il mouse fisico.
     ctrlc::set_handler(move || signal_flag.store(false, Ordering::SeqCst))
-        .context("impossibile installare il gestore di Ctrl+C")?;
+        .context("impossibile installare il gestore dei segnali")?;
+
+    // PID file: permette alla GUI di individuare il motore e fermarlo con SIGTERM.
+    let _pid_guard = match args.pidfile.as_deref() {
+        Some(path) => Some(write_pid_file(path)?),
+        None => None,
+    };
+
+    let virtual_mouse = Arc::new(Mutex::new(virtual_mouse));
+    let (emitter_tx, emitter_handle) =
+        start_click_emitter(Arc::clone(&virtual_mouse), Arc::clone(&running));
 
     let mut overlay_stdin: Option<ChildStdin> = match args.osd {
         OsdMode::Overlay => match start_overlay_helper() {
@@ -334,17 +362,36 @@ fn run() -> Result<()> {
     let mut osd_warning_shown = false;
 
     while running.load(Ordering::SeqCst) {
-        let incoming: Vec<InputEvent> = match physical.fetch_events() {
-            Ok(events) => events.collect(),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(3));
+        // Aspetta l'arrivo di eventi sul descrittore (max 2 ms) invece di dormire a vuoto:
+        // latenza minima e nessun consumo di CPU quando il mouse è fermo.
+        let mut poll_fd = libc::pollfd {
+            fd: physical.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 2) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                // Segnale ricevuto: ricontrolla `running` ed esci se richiesto.
                 continue;
             }
+            return Err(error).context("errore durante l'attesa degli eventi del mouse");
+        }
+        if poll_fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            bail!("il dispositivo di input non è più disponibile (mouse scollegato?)");
+        }
+        if ready == 0 {
+            continue;
+        }
+
+        let incoming: Vec<InputEvent> = match physical.fetch_events() {
+            Ok(events) => events.collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(error) => return Err(error).context("errore durante la lettura del mouse"),
         };
 
         if incoming.is_empty() {
-            thread::sleep(Duration::from_millis(3));
             continue;
         }
 
@@ -421,20 +468,25 @@ fn run() -> Result<()> {
                 }
 
                 if !forwarded_frame.is_empty() {
-                    virtual_mouse
+                    let mut device = virtual_mouse.lock().unwrap_or_else(|error| error.into_inner());
+                    device
                         .emit(&forwarded_frame)
                         .context("impossibile inoltrare un frame al mouse virtuale")?;
                 }
 
+                // I click aggiuntivi vengono accodati al thread dedicato: il loop di
+                // lettura non si ferma mai, quindi il puntatore resta fluido anche
+                // mentre i click extra vengono generati.
                 for (button, count) in extra_clicks {
-                    emit_extra_clicks(
-                        &mut virtual_mouse,
+                    let batch = ExtraClicks {
                         button,
                         count,
-                        args.gap_ms,
-                        args.press_ms,
-                        &running,
-                    )?;
+                        gap_ms: args.gap_ms,
+                        press_ms: args.press_ms,
+                    };
+                    if emitter_tx.send(batch).is_err() {
+                        eprintln!("ClickForge: il thread dei click aggiuntivi non risponde; click extra ignorati.");
+                    }
                 }
             } else if matches!(event.event_type(), EventType::KEY | EventType::RELATIVE | EventType::MISC) {
                 frame.push(event);
@@ -442,6 +494,10 @@ fn run() -> Result<()> {
         }
     }
 
+    // Chiudi prima il canale dei click aggiuntivi e lascia terminare il thread
+    // (esce entro press_ms), poi rilascia il mouse fisico.
+    drop(emitter_tx);
+    let _ = emitter_handle.join();
     let _ = physical.ungrab();
     drop(overlay_stdin);
     println!("\nClickForge fermato.");
@@ -622,27 +678,155 @@ fn list_devices() {
     if count == 0 { println!("Nessun dispositivo trovato. Prova a eseguire il comando con sudo."); }
 }
 
-fn emit_extra_clicks(
-    virtual_mouse: &mut evdev::uinput::VirtualDevice,
+/// Un lotto di click aggiuntivi generato dalla pressione di un pulsante fisico.
+struct ExtraClicks {
     button: KeyCode,
-    extra_clicks: u8,
+    count: u8,
     gap_ms: u64,
     press_ms: u64,
-    running: &AtomicBool,
-) -> Result<()> {
-    for _ in 0..extra_clicks {
-        if !running.load(Ordering::SeqCst) { break; }
-        if gap_ms > 0 { thread::sleep(Duration::from_millis(gap_ms)); }
-        if !running.load(Ordering::SeqCst) { break; }
-        virtual_mouse
-            .emit(&[InputEvent::new(EventType::KEY.0, button.0, 1)])
-            .context("impossibile generare la pressione virtuale")?;
-        thread::sleep(Duration::from_millis(press_ms));
-        virtual_mouse
-            .emit(&[InputEvent::new(EventType::KEY.0, button.0, 0)])
-            .context("impossibile generare il rilascio virtuale")?;
+}
+
+/// Avvia il thread dedicato ai click aggiuntivi. Emette i click con la stessa cadenza
+/// di prima (gap_ms prima di ogni click, pressione di press_ms), ma senza bloccare il
+/// loop principale: movimento del puntatore ed eventi del mouse fisico non vengono
+/// più accumulati in attesa che i click extra finiscano.
+fn start_click_emitter(
+    virtual_mouse: Arc<Mutex<VirtualDevice>>,
+    running: Arc<AtomicBool>,
+) -> (mpsc::Sender<ExtraClicks>, thread::JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel::<ExtraClicks>();
+    let handle = thread::spawn(move || {
+        while let Ok(batch) = receiver.recv() {
+            for _ in 0..batch.count {
+                if !running.load(Ordering::SeqCst) {
+                    return;
+                }
+                if batch.gap_ms > 0 {
+                    thread::sleep(Duration::from_millis(batch.gap_ms));
+                }
+                if !running.load(Ordering::SeqCst) {
+                    return;
+                }
+                {
+                    let mut device = virtual_mouse.lock().unwrap_or_else(|error| error.into_inner());
+                    if let Err(error) = device.emit(&[InputEvent::new(EventType::KEY.0, batch.button.0, 1)]) {
+                        eprintln!("ClickForge: impossibile generare la pressione virtuale: {error}");
+                        return;
+                    }
+                }
+                thread::sleep(Duration::from_millis(batch.press_ms));
+                {
+                    let mut device = virtual_mouse.lock().unwrap_or_else(|error| error.into_inner());
+                    if let Err(error) = device.emit(&[InputEvent::new(EventType::KEY.0, batch.button.0, 0)]) {
+                        eprintln!("ClickForge: impossibile generare il rilascio virtuale: {error}");
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    (sender, handle)
+}
+
+/// Rimuove il pid file quando il processo termina (anche su errore o Ctrl+C).
+struct PidFileGuard(PathBuf);
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
-    Ok(())
+}
+
+fn write_pid_file(path: &Path) -> Result<PidFileGuard> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("impossibile creare la cartella {}", parent.display()))?;
+    }
+    std::fs::write(path, format!("{}\n", std::process::id()))
+        .with_context(|| format!("impossibile scrivere il pid file {}", path.display()))?;
+    Ok(PidFileGuard(path.to_path_buf()))
+}
+
+/// UID dell'utente che ha invocato il comando tramite pkexec o sudo, se presente.
+fn invoking_uid() -> Option<u32> {
+    ["PKEXEC_UID", "SUDO_UID"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find_map(|value| value.trim().parse::<u32>().ok())
+}
+
+/// Se il processo è root avviato tramite pkexec/sudo, riallinea l'ambiente alla
+/// sessione grafica dell'utente reale (Wayland, D-Bus, HOME) e rilascia i privilegi.
+/// Ritorna true se il rilascio è avvenuto. In caso di fallimento il motore continua
+/// come root e tutto funziona come prima.
+fn drop_privileges_to_invoking_user() -> bool {
+    if unsafe { libc::geteuid() } != 0 {
+        return false;
+    }
+    let uid = match invoking_uid() {
+        Some(uid) => uid,
+        None => return false,
+    };
+
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 16384];
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut pwd,
+            buffer.as_mut_ptr() as *mut libc::c_char,
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        eprintln!("ClickForge: impossibile risolvere i dati dell'utente (UID {uid}); continuo come root.");
+        return false;
+    }
+    let gid = pwd.pw_gid;
+    if pwd.pw_dir.is_null() || pwd.pw_name.is_null() {
+        eprintln!("ClickForge: voce passwd incompleta per UID {uid}; continuo come root.");
+        return false;
+    }
+    let home = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }
+        .to_string_lossy()
+        .into_owned();
+    let username = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }
+        .to_string_lossy()
+        .into_owned();
+
+    let runtime_dir = format!("/run/user/{uid}");
+    if Path::new(&runtime_dir).is_dir() {
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+        let bus = format!("{runtime_dir}/bus");
+        if Path::new(&bus).exists() && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            std::env::set_var("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={bus}"));
+        }
+        let wayland_ok = std::env::var("WAYLAND_DISPLAY")
+            .ok()
+            .map(|display| Path::new(&runtime_dir).join(&display).exists())
+            .unwrap_or(false);
+        if !wayland_ok {
+            match find_wayland_socket(&runtime_dir) {
+                Some(display) => std::env::set_var("WAYLAND_DISPLAY", display),
+                // WAYLAND_DISPLAY obsoleto o assente: rimuovilo per non puntare a un socket inesistente.
+                None => std::env::remove_var("WAYLAND_DISPLAY"),
+            }
+        }
+    }
+    std::env::set_var("HOME", &home);
+    std::env::set_var("USER", &username);
+    std::env::set_var("LOGNAME", &username);
+
+    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+        eprintln!("ClickForge: impossibile azzerare i gruppi supplementari; continuo comunque.");
+    }
+    if unsafe { libc::setgid(gid) } != 0 || unsafe { libc::setuid(uid) } != 0 {
+        eprintln!("ClickForge: impossibile rilasciare i privilegi di root; continuo come root.");
+        return false;
+    }
+    true
 }
 
 fn start_overlay_helper() -> Result<ChildStdin> {
@@ -698,6 +882,11 @@ fn start_overlay_helper() -> Result<ChildStdin> {
     } else {
         command = Command::new(executable);
         command.arg("--osd-server");
+        // L'overlay richiede il backend Wayland (Layer Shell): forzalo quando
+        // il socket Wayland è noto, altrimenti GTK potrebbe scegliere X11.
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            command.env("GDK_BACKEND", "wayland");
+        }
     }
 
     let mut child = command
@@ -943,17 +1132,22 @@ fn show_status_notification(
     let active = double_enabled || triple_enabled;
     let body = describe_modes(double_enabled, triple_enabled, double_rules, triple_rules);
     let mut command = Command::new("notify-send");
-    if let (Ok(username), Ok(uid)) = (std::env::var("SUDO_USER"), std::env::var("SUDO_UID")) {
-        let runtime_dir = format!("/run/user/{uid}");
-        let bus_path = format!("{runtime_dir}/bus");
-        if Path::new(&bus_path).exists() {
-            command = Command::new("runuser");
-            command
-                .arg("-u").arg(username).arg("--").arg("env")
-                .arg(format!("DBUS_SESSION_BUS_ADDRESS=unix:path={bus_path}"))
-                .arg(format!("XDG_RUNTIME_DIR={runtime_dir}"))
-                .arg("PATH=/usr/bin:/bin")
-                .arg("/usr/bin/notify-send");
+    // Il percorso runuser serve solo quando siamo ancora root (es. sessione senza
+    // PKEXEC_UID/SUDO_UID). Dopo il rilascio dei privilegi, XDG_RUNTIME_DIR e
+    // DBUS_SESSION_BUS_ADDRESS sono già riallineati alla sessione utente.
+    if unsafe { libc::geteuid() } == 0 {
+        if let (Ok(username), Ok(uid)) = (std::env::var("SUDO_USER"), std::env::var("SUDO_UID")) {
+            let runtime_dir = format!("/run/user/{uid}");
+            let bus_path = format!("{runtime_dir}/bus");
+            if Path::new(&bus_path).exists() {
+                command = Command::new("runuser");
+                command
+                    .arg("-u").arg(username).arg("--").arg("env")
+                    .arg(format!("DBUS_SESSION_BUS_ADDRESS=unix:path={bus_path}"))
+                    .arg(format!("XDG_RUNTIME_DIR={runtime_dir}"))
+                    .arg("PATH=/usr/bin:/bin")
+                    .arg("/usr/bin/notify-send");
+            }
         }
     }
     command
@@ -992,6 +1186,30 @@ mod tests {
     fn rejects_using_toggle_as_multiplier() {
         let rules = vec![ClickRule { button: MouseButton::Back, clicks: 2 }];
         assert!(validate_rules(&rules, &[], ToggleButton::Back, ToggleButton::Forward).is_err());
+    }
+
+    #[test]
+    fn pid_file_is_removed_when_guard_drops() {
+        let path = std::env::temp_dir()
+            .join(format!("clickforge-test-{}-{}.pid", std::process::id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()));
+        {
+            let guard = write_pid_file(&path).expect("il pid file dovrebbe essere creato");
+            assert!(path.exists());
+            let contents = std::fs::read_to_string(&path).expect("il pid file dovrebbe essere leggibile");
+            assert_eq!(contents.trim(), std::process::id().to_string());
+            drop(guard);
+        }
+        assert!(!path.exists(), "il pid file dovrebbe essere rimosso alla chiusura");
+    }
+
+    #[test]
+    fn select_requires_both_profiles_enabled_for_double_fallback() {
+        let double_rules = vec![ClickRule { button: MouseButton::Middle, clicks: 2 }];
+        assert_eq!(select_click_count(KeyCode::BTN_MIDDLE, &double_rules, &[], false, true), None);
+        assert_eq!(select_click_count(KeyCode::BTN_MIDDLE, &double_rules, &[], true, false), Some(2));
     }
 
     #[test]

@@ -1,0 +1,44 @@
+# CI workflow di ClickForge (copia di riferimento).
+# La GitHub App di questa sandbox non può creare/aggiornare
+# .github/workflows/ci.yml (manca il permesso `workflows`), quindi il file è
+# qui. Per attivarlo sul repository:
+#   mkdir -p .github/workflows
+#   cp packaging/ci.yml .github/workflows/ci.yml
+#   git add .github/workflows/ci.yml && git commit && git push
+# (oppure concedi alla GitHub App il permesso `workflows` e fai git push)
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: build + test (Arch Linux)
+    runs-on: ubuntu-latest
+    # Stessa base indicata nel README (CachyOS / Arch Linux): garantisce la
+    # disponibilità dei pacchetti gtk4 e gtk4-layer-shell.
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Installa dipendenze di sistema
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust rustfmt clippy gtk4 gtk4-layer-shell polkit
+
+      - uses: actions/checkout@v4
+
+      - name: Controlli di compilazione
+        run: cargo check --all-targets
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Clippy (informativo)
+        run: cargo clippy --all-targets || true
+
+      - name: Build di rilascio
+        run: cargo build --release
+
+      - name: Verifica --help
+        run: ./target/release/clickforge --help

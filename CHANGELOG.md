@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.0
+
+- **Corretto lo scatto del puntatore durante i click moltiplicati:** i click aggiuntivi sono emessi da un thread dedicato; il loop di lettura del mouse fisico non esegue più sleep da `gap_ms`/`press_ms` e continua a inoltrare movimento e rotellina in tempo reale.
+- **Loop basato su `poll(2)`** con timeout di 2 ms invece dello sleep fisso di 3 ms.
+- **"Ferma" dalla GUI funziona davvero:** il motore rilascia i privilegi di root dopo l'apertura dei dispositivi (torna all'utente di `pkexec`/`sudo` via `PKEXEC_UID`/`SUDO_UID`, con `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, `WAYLAND_DISPLAY`, `HOME` riallineati), scrive un pid file (`~/.config/clickforge/clickforge.pid`) e la GUI gli invia `SIGTERM`; il motore gestisce `SIGTERM`/`SIGHUP` oltre a `Ctrl+C` e rilascia il mouse fisico. Fallback alla modalità 0.6.0 se il pid file manca.
+- Nuova opzione `--pidfile <PATH>`.
+- Messaggio chiaro se il dispositivo di input viene scollegato (POLLERR/POLLHUP/POLLNVAL).
+- Overlay e notifiche: dopo il rilascio dei privilegi girano direttamente come utente; il percorso `runuser` resta solo per root senza sessione individuabile.
+- Nuovi test unitari (pid file, selezione profilo, validazione GUI).
+- Workflow CI incluso come `packaging/ci.yml` (architettura: check, test, clippy, build di rilascio su Arch Linux); per attivarlo vedere "CI e packaging" nel README (l'automazione non aveva il permesso `workflows` per `.github/workflows/`). Packaging Arch di esempio in `packaging/PKGBUILD`.
+- `Cargo.lock` rimosso da .gitignore (da committare per build riproducibili).
+
 ## 0.6.0
 
 - Aggiunta la possibilità di associare più pulsanti a ciascun profilo.
