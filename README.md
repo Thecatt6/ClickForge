@@ -244,13 +244,7 @@ Il vecchio argomento `--click-button` e i relativi conteggi `--double-clicks` / 
 
 ## CI e packaging
 
-- `packaging/ci.yml`: workflow GitHub Actions di riferimento (check, test, clippy, build di rilascio su Arch Linux). Il workflow non è stato attivato automaticamente perché l'automazione di questa sessione non ha il permesso `workflows` per scrivere in `.github/workflows/`. Per attivarlo sul repository:
-
-  ```bash
-  mkdir -p .github/workflows
-  cp packaging/ci.yml .github/workflows/ci.yml
-  git add .github/workflows/ci.yml && git commit -m "CI: attiva workflow GitHub Actions" && git push
-  ```
+- `.github/workflows/ci.yml`: workflow GitHub Actions (check, test, clippy, build di rilascio su Arch Linux). Parte a ogni push su `main` e su ogni pull request.
 - `packaging/PKGBUILD`: esempio di pacchetto Arch Linux (dipendenze, installazione, licenza e doc). Aggiornare il tag `v0.7.0` e i checksum alla creazione del rilascio.
 
 Licenza: MIT.

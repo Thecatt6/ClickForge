@@ -623,7 +623,7 @@ fn build_window(app: &gtk::Application) {
                 // Rimetti il processo sotto sorveglianza della GUI: l'utente potrà
                 // riprovare Ferma dopo aver terminato il motore manualmente.
                 *process.borrow_mut() = Some(child);
-                status.set_text(format!(
+                status.set_text(&format!(
                     "Il motore gira come root e non può essere fermato dalla GUI. Esegui: sudo kill -TERM {pid}"
                 ));
                 return;
@@ -637,9 +637,9 @@ fn build_window(app: &gtk::Application) {
             let _ = child.wait();
             let _ = fs::remove_file(&pidfile);
             status.set_text(if engine_stopped {
-                "ClickForge arrestato. Il mouse fisico è stato rilasciato.".to_string()
+                "ClickForge arrestato. Il mouse fisico è stato rilasciato."
             } else {
-                "Arresto forzato inviato. Se il mouse resta catturato, controlla clickforge.log.".to_string()
+                "Arresto forzato inviato. Se il mouse resta catturato, controlla clickforge.log."
             });
         });
     }

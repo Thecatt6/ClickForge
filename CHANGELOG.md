@@ -9,7 +9,7 @@
 - Messaggio chiaro se il dispositivo di input viene scollegato (POLLERR/POLLHUP/POLLNVAL).
 - Overlay e notifiche: dopo il rilascio dei privilegi girano direttamente come utente; il percorso `runuser` resta solo per root senza sessione individuabile.
 - Nuovi test unitari (pid file, selezione profilo, validazione GUI).
-- Workflow CI incluso come `packaging/ci.yml` (architettura: check, test, clippy, build di rilascio su Arch Linux); per attivarlo vedere "CI e packaging" nel README (l'automazione non aveva il permesso `workflows` per `.github/workflows/`). Packaging Arch di esempio in `packaging/PKGBUILD`.
+- CI GitHub Actions in `.github/workflows/ci.yml` (check, test, clippy, build di rilascio su Arch Linux). Packaging Arch di esempio in `packaging/PKGBUILD`.
 - `Cargo.lock` rimosso da .gitignore (da committare per build riproducibili).
 
 ## 0.6.0
